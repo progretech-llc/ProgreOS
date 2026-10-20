@@ -24,9 +24,9 @@ VENV = ROOT / ".progre-venv"
 REQ = ROOT / "bridge" / "requirements.txt"
 
 BRIDGE_HOST = "127.0.0.1"
-BRIDGE_PORT = 8765
+BRIDGE_PORT = int(os.environ.get("PROGRE_BRIDGE_PORT", "8785"))
 COCKPIT_HOST = "127.0.0.1"
-COCKPIT_PORT = 8766
+COCKPIT_PORT = int(os.environ.get("PROGRE_COCKPIT_PORT", "8786"))
 
 
 def vpython() -> Path:

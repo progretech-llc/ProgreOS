@@ -448,6 +448,8 @@ static esp_err_t progre_audio_stream_http_event(
         return ESP_OK;
     }
 
+    if (esp_http_client_get_status_code(evt->client) != 200) return ESP_OK;
+
     if (evt->event_id != HTTP_EVENT_ON_DATA ||
         evt->data == NULL ||
         evt->data_len <= 0) {
@@ -544,6 +546,13 @@ static esp_err_t progre_audio_stream_http_event(
                     (uint16_t)lo
                 );
         }
+
+        unsigned peak = 0;
+        for (size_t i = 0; i < frames; ++i) {
+            unsigned magnitude = samples[i] < 0 ? -(int)samples[i] : samples[i];
+            if (magnitude > peak) peak = magnitude;
+        }
+        progre_display_set_level(peak * 100 / 32768);
 
         esp_err_t err =
             progre_audio_stream_write(

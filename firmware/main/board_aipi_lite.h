@@ -37,3 +37,6 @@
 #define PROGRE_AUDIO_SAMPLE_RATE  16000
 
 #define PROGRE_LCD_SPI_HZ      (20 * 1000 * 1000)
+
+/* AIPI board-power latch; assert before initializing peripherals. */
+#define PROGRE_POWER_HOLD_PIN 10

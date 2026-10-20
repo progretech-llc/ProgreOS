@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import base64
 import subprocess
 import tempfile
@@ -20,6 +21,7 @@ APP_NAME = "progre-voice-bridge"
 PROTOCOL_VERSION = 1
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16000 * 2 * 8
 
 
 PROGRE_OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
@@ -407,13 +409,13 @@ if __name__ == "__main__":
     print(" PROGRE VOICE BRIDGE")
     print("=" * 60)
     print(f" Host:     {hostname}")
-    print(" Listen:   0.0.0.0:8765")
+    print(" Listen:   0.0.0.0:8785")
     print(f" Protocol: {PROTOCOL_VERSION}")
     print("=" * 60)
 
     app.run(
         host="0.0.0.0",
-        port=8765,
+        port=int(os.environ.get("PROGRE_BRIDGE_PORT", "8785")),
         debug=False,
         threaded=True,
     )

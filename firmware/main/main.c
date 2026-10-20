@@ -5,7 +5,7 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_random.h"
+#include "esp_heap_caps.h"
 
 #include "board_aipi_lite.h"
 #include "progre_audio.h"
@@ -18,10 +18,6 @@ static const char *TAG = "PROGRE";
 
 #define BUTTON_DEBOUNCE_MS 30
 #define MAIN_POLL_MS       10
-#define BLINK_MIN_INTERVAL_MS 2800
-#define BLINK_MAX_INTERVAL_MS 6500
-#define BLINK_DURATION_MS  180
-#define MIC_MEASURE_INTERVAL_MS 250
 
 static void talk_button_init(void)
 {
@@ -43,21 +39,26 @@ static bool talk_button_raw_pressed(void)
 
 
 enum {
-    PROGRE_CAPTURE_MAX_SECONDS = 2,
+    PROGRE_CAPTURE_MAX_SECONDS = 8,
     PROGRE_CAPTURE_MAX_FRAMES =
         PROGRE_AUDIO_SAMPLE_RATE *
         PROGRE_CAPTURE_MAX_SECONDS,};
 
-static int16_t s_voice_capture[
-    PROGRE_CAPTURE_MAX_FRAMES
-];
+static int16_t *s_voice_capture;
 
 
 void app_main(void)
 {
+    /* Keep battery power after the user releases the hardware power button. */
+    gpio_set_level(PROGRE_POWER_HOLD_PIN, 1);
+    gpio_set_direction(PROGRE_POWER_HOLD_PIN, GPIO_MODE_OUTPUT);
+    s_voice_capture = heap_caps_malloc(
+        PROGRE_CAPTURE_MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    ESP_ERROR_CHECK(s_voice_capture ? ESP_OK : ESP_ERR_NO_MEM);
+
     ESP_LOGI(TAG, "================================");
-    ESP_LOGI(TAG, "        PROGRE OS v0.7");
-    ESP_LOGI(TAG, "       PORTABLE COMPANION");
+    ESP_LOGI(TAG, "        PROGRE OS v1.1");
+    ESP_LOGI(TAG, "       LOCAL ROBOT COMPANION");
     ESP_LOGI(TAG, "================================");
 
     ESP_ERROR_CHECK(progre_display_init());
@@ -78,6 +79,14 @@ void app_main(void)
         if (microphone_init == ESP_OK) {
             microphone_ready = true;
             ESP_LOGI(TAG, "Microphone initialization PASS.");
+        } else {
+            ESP_LOGW(TAG, "Microphone initialization unavailable: %s",
+                     esp_err_to_name(microphone_init));
+        }
+    } else {
+        ESP_LOGW(TAG, "Audio codec discovery unavailable: %s",
+                 esp_err_to_name(audio_probe));
+    }
 
     esp_err_t wifi_err = progre_wifi_init();
     ESP_ERROR_CHECK(progre_usb_control_init());
@@ -89,22 +98,6 @@ void app_main(void)
                  esp_err_to_name(wifi_err));
     }
 
-        } else {
-            ESP_LOGW(TAG, "Microphone initialization unavailable: %s",
-                     esp_err_to_name(microphone_init));
-        }
-    } else {
-        ESP_LOGW(TAG, "Audio codec discovery unavailable: %s",
-                 esp_err_to_name(audio_probe));
-    }
-
-    int companion_x = 47;
-    int companion_dir = 1;
-    bool walk_step = false;
-
-    TickType_t next_walk =
-        xTaskGetTickCount() +
-        pdMS_TO_TICKS(350);
 
     bool stable_pressed = talk_button_raw_pressed();
     bool candidate_pressed = stable_pressed;
@@ -113,23 +106,9 @@ void app_main(void)
     size_t voice_capture_frames = 0;
     bool voice_capture_full = false;
 
-    bool blink_active = false;
-    TickType_t blink_until = 0;
-
-    uint32_t blink_span =
-        BLINK_MAX_INTERVAL_MS -
-        BLINK_MIN_INTERVAL_MS + 1;
-
-    TickType_t next_blink =
-        xTaskGetTickCount() +
-        pdMS_TO_TICKS(
-            BLINK_MIN_INTERVAL_MS +
-            (esp_random() % blink_span)
-        );
-
     if (stable_pressed) {
         ESP_LOGI(TAG, "Talk button held at startup.");
-        progre_display_show_companion(companion_x, true, false, walk_step);
+        progre_display_show_companion(47, true, false, false);
     }
 
     while (1) {
@@ -154,8 +133,7 @@ void app_main(void)
                 ESP_LOGI(TAG, "Talk button PRESSED — listening");
                 voice_capture_frames = 0;
                 voice_capture_full = false;
-                blink_active = false;
-                progre_display_show_companion(companion_x, true, false, walk_step);
+                progre_display_show_companion(47, true, false, false);
             } else {
                 ESP_LOGI(
                     TAG,
@@ -167,6 +145,7 @@ void app_main(void)
                 if (microphone_ready &&
                     voice_capture_frames > 0) {
 
+                    progre_display_set_thinking(true);
                     esp_err_t conversation_err =
                         progre_bridge_exchange_audio_stream(
                             s_voice_capture,
@@ -183,73 +162,6 @@ void app_main(void)
 
                     progre_display_show_companion(47, false, false, false);
                 }
-            }
-        }
-
-        /*
-         * Tiny companion roaming.
-         * Walking pauses while listening or blinking.
-         */
-        if (!stable_pressed &&
-            !blink_active &&
-            now >= next_walk) {
-
-            companion_x += companion_dir * 2;
-
-            if (companion_x <= 4) {
-                companion_x = 4;
-                companion_dir = 1;
-            } else if (
-                companion_x >=
-                PROGRE_LCD_WIDTH - 38
-            ) {
-                companion_x =
-                    PROGRE_LCD_WIDTH - 38;
-                companion_dir = -1;
-            }
-
-            walk_step = !walk_step;
-
-            progre_display_show_companion(
-                companion_x,
-                false,
-                false,
-                walk_step
-            );
-
-            next_walk =
-                now +
-                pdMS_TO_TICKS(
-                    260 + (esp_random() % 240)
-                );
-        }
-
-        /*
-         * Natural idle blink.
-         *
-         * Talking/listening always owns the display. Blink is only
-         * allowed while idle and consists of one short second frame.
-         */
-        if (!stable_pressed) {
-            if (blink_active) {
-                if (now >= blink_until) {
-                    blink_active = false;
-                    progre_display_show_companion(47, false, false, false);
-
-                    next_blink =
-                        now +
-                        pdMS_TO_TICKS(
-                            BLINK_MIN_INTERVAL_MS +
-                            (esp_random() % blink_span)
-                        );
-                }
-            } else if (now >= next_blink) {
-                blink_active = true;
-                blink_until =
-                    now +
-                    pdMS_TO_TICKS(BLINK_DURATION_MS);
-
-                progre_display_show_companion(companion_x, false, true, walk_step);
             }
         }
 
@@ -308,6 +220,6 @@ void app_main(void)
             }
         }
 
-
+        vTaskDelay(pdMS_TO_TICKS(MAIN_POLL_MS));
     }
 }

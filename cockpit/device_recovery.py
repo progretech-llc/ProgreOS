@@ -94,6 +94,8 @@ def backup(serial_port: str):
     if partial.exists():
         partial.unlink()
 
+    partial.touch(mode=0o600, exist_ok=False)
+
     cmd = _esptool_command() + [
         "--chip", "esp32s3",
         "--port", serial_port,
@@ -124,6 +126,7 @@ def backup(serial_port: str):
     partial.replace(final)
 
     lifecycle = _load_lifecycle()
+    source_state = lifecycle.get("detection", {}).get("state", "unknown")
     recovery = lifecycle.setdefault("recovery", {})
 
     recovery.update({
@@ -148,8 +151,8 @@ def backup(serial_port: str):
     return {
         "ok": True,
         "verified": True,
-        "source_state": rec.get("source_state", "legacy"),
-        "backup_kind": rec.get("backup_kind", "legacy"),
+        "source_state": recovery.get("source_state", "legacy"),
+        "backup_kind": recovery.get("backup_kind", "legacy"),
         "file": str(final),
         "size": size,
         "sha256": digest,

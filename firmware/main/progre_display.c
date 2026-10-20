@@ -84,34 +84,27 @@ static void lcd_set_window(int x0, int y0, int x1, int y1)
     lcd_cmd(CMD_RAMWR);
 }
 
+static uint8_t frame[PROGRE_LCD_HEIGHT][PROGRE_LCD_WIDTH * 2];
+
 static void lcd_fill_rect(int x, int y, int w, int h, uint16_t color)
 {
-    if (x < 0 || y < 0 || w <= 0 || h <= 0) {
-        return;
-    }
+    if (x < 0 || y < 0 || x >= PROGRE_LCD_WIDTH || y >= PROGRE_LCD_HEIGHT ||
+        w <= 0 || h <= 0) return;
+    if (x + w > PROGRE_LCD_WIDTH) w = PROGRE_LCD_WIDTH - x;
+    if (y + h > PROGRE_LCD_HEIGHT) h = PROGRE_LCD_HEIGHT - y;
+    for (int yy = y; yy < y + h; ++yy)
+        for (int xx = x; xx < x + w; ++xx) {
+            frame[yy][xx * 2] = color >> 8;
+            frame[yy][xx * 2 + 1] = color & 0xff;
+        }
+}
 
-    if (x + w > PROGRE_LCD_WIDTH) {
-        w = PROGRE_LCD_WIDTH - x;
-    }
-
-    if (y + h > PROGRE_LCD_HEIGHT) {
-        h = PROGRE_LCD_HEIGHT - y;
-    }
-
-    lcd_set_window(x, y, x + w - 1, y + h - 1);
-
-    uint8_t row[PROGRE_LCD_WIDTH * 2];
-
-    for (int i = 0; i < w; ++i) {
-        row[i * 2]     = (color >> 8) & 0xFF;
-        row[i * 2 + 1] = color & 0xFF;
-    }
-
+static void lcd_flush(void)
+{
+    lcd_set_window(0, 0, PROGRE_LCD_WIDTH - 1, PROGRE_LCD_HEIGHT - 1);
     gpio_set_level(PROGRE_LCD_PIN_DC, 1);
-
-    for (int yy = 0; yy < h; ++yy) {
-        lcd_tx(row, w * 2);
-    }
+    for (int y = 0; y < PROGRE_LCD_HEIGHT; ++y)
+        lcd_tx(frame[y], sizeof(frame[y]));
 }
 
 static void lcd_clear(uint16_t color)
@@ -125,328 +118,88 @@ static void lcd_clear(uint16_t color)
     );
 }
 
-/*
- * Tiny 5x7 glyph set containing only the letters needed for "PROGRE".
- * Bit 4 is the left-most pixel.
- */
-typedef struct {
-    char ch;
-    uint8_t rows[7];
-} glyph_t;
+/* Only the display task owns SPI; audio and USB update this small state. */
+static portMUX_TYPE face_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool face_listening, face_thinking;
+static unsigned face_level;
+static uint16_t face_color = COLOR_WHITE;
 
-static const glyph_t glyphs[] = {
-    {'P', {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}},
-    {'R', {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}},
-    {'O', {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}},
-    {'G', {0x0E,0x11,0x10,0x17,0x11,0x11,0x0E}},
-    {'E', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}},
-};
-
-static const uint8_t *glyph_for(char c)
+void progre_display_show_companion(int x, bool active, bool blink, bool step)
 {
-    for (unsigned i = 0; i < sizeof(glyphs) / sizeof(glyphs[0]); ++i) {
-        if (glyphs[i].ch == c) {
-            return glyphs[i].rows;
-        }
-    }
-
-    return NULL;
+    (void)x; (void)blink; (void)step;
+    portENTER_CRITICAL(&face_lock);
+    face_listening = active;
+    face_thinking = false;
+    face_level = 0;
+    portEXIT_CRITICAL(&face_lock);
 }
 
-static void draw_char(int x, int y, char c, uint16_t color, int scale)
+void progre_display_show_banner(const char *text, int scroll_x)
 {
-    const uint8_t *rows = glyph_for(c);
-
-    if (!rows) {
-        return;
-    }
-
-    for (int yy = 0; yy < 7; ++yy) {
-        for (int xx = 0; xx < 5; ++xx) {
-            if (rows[yy] & (1 << (4 - xx))) {
-                lcd_fill_rect(
-                    x + xx * scale,
-                    y + yy * scale,
-                    scale,
-                    scale,
-                    color
-                );
-            }
-        }
-    }
+    /* The face replaces the old six-glyph scrolling caption. */
+    (void)text; (void)scroll_x;
 }
 
-static void draw_word_progre(void)
+void progre_display_set_thinking(bool thinking)
 {
-    const char *text = "PROGRE";
-    const int scale = 2;
-    const int char_w = 5 * scale;
-    const int spacing = 2;
-    const int total_w = 6 * char_w + 5 * spacing;
-    int x = (PROGRE_LCD_WIDTH - total_w) / 2;
-
-    for (int i = 0; i < 6; ++i) {
-        draw_char(x, 103, text[i], COLOR_WHITE, scale);
-        x += char_w + spacing;
-    }
+    portENTER_CRITICAL(&face_lock);
+    face_thinking = thinking;
+    portEXIT_CRITICAL(&face_lock);
 }
 
-
-static void draw_pixel(int x, int y, uint16_t color)
+void progre_display_set_level(unsigned level)
 {
-    lcd_fill_rect(x, y, 1, 1, color);
+    portENTER_CRITICAL(&face_lock);
+    face_level = level > 100 ? 100 : level;
+    face_thinking = false;
+    portEXIT_CRITICAL(&face_lock);
 }
 
-static void draw_line(
-    int x0,
-    int y0,
-    int x1,
-    int y1,
-    uint16_t color
-)
+void progre_display_set_color(uint16_t color)
 {
-    int dx = abs(x1 - x0);
-    int sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0);
-    int sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
+    portENTER_CRITICAL(&face_lock);
+    face_color = color;
+    portEXIT_CRITICAL(&face_lock);
+}
 
+static void display_task(void *arg)
+{
+    (void)arg;
     while (true) {
-        draw_pixel(x0, y0, color);
-
-        if (x0 == x1 && y0 == y1) {
-            break;
+        unsigned ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        bool listening, thinking;
+        unsigned level;
+        uint16_t color;
+        portENTER_CRITICAL(&face_lock);
+        listening = face_listening;
+        thinking = face_thinking;
+        level = face_level;
+        color = face_color;
+        portEXIT_CRITICAL(&face_lock);
+        /* A four-second triangle breath; short blink every ~4.7 seconds. */
+        unsigned phase = (ms % 4000) / 500;
+        int breath = phase < 4 ? phase : 7 - phase;
+        bool blink = !listening && !thinking && ms % 4700 < 160;
+        int eye_h = blink ? 3 : 28 + breath + (listening ? 6 : 0);
+        int y = 43 - eye_h / 2;
+        lcd_clear(COLOR_BLACK);
+        for (int eye = 0; eye < 2; ++eye) {
+            int x = 23 + eye * 58;
+            lcd_fill_rect(x + 4, y, 20, eye_h, color);
+            if (!blink) lcd_fill_rect(x, y + 4, 28, eye_h - 8, color);
         }
-
-        int e2 = 2 * err;
-
-        if (e2 >= dy) {
-            err += dy;
-            x0 += sx;
+        int mouth_h = level ? 3 + level / 7 : 3;
+        lcd_fill_rect(44, 89 - mouth_h / 2, 40, mouth_h, color);
+        if (thinking) {
+            int dot = (ms / 300) % 3;
+            for (int i = 0; i < 3; ++i)
+                lcd_fill_rect(49 + i * 13, 108, 5, 5,
+                              i == dot ? color : COLOR_DARK_GRAY);
+        } else if (listening) {
+            lcd_fill_rect(42, 109, 44, 2, color);
         }
-
-        if (e2 <= dx) {
-            err += dx;
-            y0 += sy;
-        }
-    }
-}
-
-static void draw_circle(
-    int cx,
-    int cy,
-    int radius,
-    uint16_t color
-)
-{
-    int x = radius;
-    int y = 0;
-    int err = 0;
-
-    while (x >= y) {
-        draw_pixel(cx + x, cy + y, color);
-        draw_pixel(cx + y, cy + x, color);
-        draw_pixel(cx - y, cy + x, color);
-        draw_pixel(cx - x, cy + y, color);
-        draw_pixel(cx - x, cy - y, color);
-        draw_pixel(cx - y, cy - x, color);
-        draw_pixel(cx + y, cy - x, color);
-        draw_pixel(cx + x, cy - y, color);
-
-        y++;
-
-        if (err <= 0) {
-            err += 2 * y + 1;
-        }
-
-        if (err > 0) {
-            x--;
-            err -= 2 * x + 1;
-        }
-    }
-}
-
-
-#define BANNER_HEIGHT 18
-#define TINY_SCALE     2
-#define TINY_W         34
-#define TINY_H         32
-
-static void tiny_px(int ox, int oy, int x, int y)
-{
-    lcd_fill_rect(
-        ox + x * TINY_SCALE,
-        oy + y * TINY_SCALE,
-        TINY_SCALE,
-        TINY_SCALE,
-        COLOR_WHITE
-    );
-}
-
-static void tiny_hline(
-    int ox, int oy, int x0, int x1, int y)
-{
-    for (int x = x0; x <= x1; ++x) {
-        tiny_px(ox, oy, x, y);
-    }
-}
-
-static void draw_tiny_progre(
-    int ox,
-    int oy,
-    bool active,
-    bool blink,
-    bool step)
-{
-    /*
-     * 17 x 16 logical-pixel Tamagotchi-style Progre.
-     * Rendered at 2x scale = 34 x 32 physical pixels.
-     */
-
-    tiny_hline(ox, oy, 5, 11, 0);
-    tiny_px(ox, oy, 4, 1);
-    tiny_px(ox, oy, 12, 1);
-
-    tiny_px(ox, oy, 3, 2);
-    tiny_px(ox, oy, 13, 2);
-    tiny_px(ox, oy, 2, 3);
-    tiny_px(ox, oy, 14, 3);
-
-    for (int y = 4; y <= 11; ++y) {
-        tiny_px(ox, oy, 2, y);
-        tiny_px(ox, oy, 14, y);
-    }
-
-    /* Side pods / ears. */
-    tiny_px(ox, oy, 0, 5);
-    tiny_px(ox, oy, 1, 4);
-    tiny_px(ox, oy, 1, 6);
-
-    tiny_px(ox, oy, 16, 5);
-    tiny_px(ox, oy, 15, 4);
-    tiny_px(ox, oy, 15, 6);
-
-    /* Eyes. */
-    if (blink) {
-        tiny_hline(ox, oy, 5, 6, 4);
-        tiny_hline(ox, oy, 10, 11, 4);
-    } else {
-        tiny_px(ox, oy, 5, 4);
-        tiny_px(ox, oy, 11, 4);
-    }
-
-    /* Progre's little brow / nose marks. */
-    tiny_px(ox, oy, 7, 3);
-    tiny_px(ox, oy, 9, 3);
-
-    /* Mouth. */
-    if (active) {
-        tiny_px(ox, oy, 5, 7);
-        tiny_px(ox, oy, 6, 8);
-        tiny_px(ox, oy, 7, 7);
-        tiny_px(ox, oy, 8, 8);
-        tiny_px(ox, oy, 9, 7);
-        tiny_px(ox, oy, 10, 8);
-        tiny_px(ox, oy, 11, 7);
-
-        tiny_hline(ox, oy, 5, 11, 10);
-        tiny_px(ox, oy, 5, 9);
-        tiny_px(ox, oy, 11, 9);
-    } else {
-        tiny_px(ox, oy, 5, 8);
-        tiny_px(ox, oy, 6, 7);
-        tiny_px(ox, oy, 7, 8);
-        tiny_px(ox, oy, 8, 7);
-        tiny_px(ox, oy, 9, 8);
-        tiny_px(ox, oy, 10, 7);
-        tiny_px(ox, oy, 11, 8);
-    }
-
-    /* Lower body. */
-    tiny_px(ox, oy, 3, 12);
-    tiny_px(ox, oy, 4, 13);
-    tiny_hline(ox, oy, 5, 11, 14);
-    tiny_px(ox, oy, 12, 13);
-    tiny_px(ox, oy, 13, 12);
-
-    /*
-     * Two-frame walk. One foot extends while the other retracts.
-     */
-    if (step) {
-        tiny_hline(ox, oy, 4, 6, 15);
-        tiny_hline(ox, oy, 11, 12, 15);
-    } else {
-        tiny_hline(ox, oy, 4, 5, 15);
-        tiny_hline(ox, oy, 10, 12, 15);
-    }
-}
-
-void progre_display_show_companion(
-    int x,
-    bool active,
-    bool blink,
-    bool step)
-{
-    lcd_clear(COLOR_BLACK);
-
-    /* Quiet divider below the speech-banner region. */
-    lcd_fill_rect(
-        0,
-        BANNER_HEIGHT - 1,
-        PROGRE_LCD_WIDTH,
-        1,
-        COLOR_DARK_GRAY
-    );
-
-    if (x < 0) {
-        x = 0;
-    }
-
-    if (x > PROGRE_LCD_WIDTH - TINY_W) {
-        x = PROGRE_LCD_WIDTH - TINY_W;
-    }
-
-    const int floor_y =
-        PROGRE_LCD_HEIGHT - TINY_H - 5;
-
-    draw_tiny_progre(
-        x,
-        floor_y,
-        active,
-        blink,
-        step
-    );
-}
-
-void progre_display_show_banner(
-    const char *text,
-    int scroll_x)
-{
-    lcd_fill_rect(
-        0,
-        0,
-        PROGRE_LCD_WIDTH,
-        BANNER_HEIGHT - 1,
-        COLOR_BLACK
-    );
-
-    if (text == NULL || text[0] == '\0') {
-        return;
-    }
-
-    int x = scroll_x;
-
-    for (const char *c = text; *c; ++c) {
-        if (x > -6 && x < PROGRE_LCD_WIDTH) {
-            draw_char(
-                x,
-                4,
-                *c,
-                COLOR_WHITE,
-                1
-            );
-        }
-        x += 6;
+        lcd_flush();
+        vTaskDelay(pdMS_TO_TICKS(80));
     }
 }
 
@@ -528,6 +281,9 @@ esp_err_t progre_display_init(void)
     gpio_set_level(PROGRE_LCD_PIN_BL, 1);
 
     ESP_LOGI(TAG, "Display initialized");
+
+    if (xTaskCreate(display_task, "progre_face", 3072, NULL, 2, NULL) != pdPASS)
+        return ESP_ERR_NO_MEM;
 
     return ESP_OK;
 }

@@ -11,6 +11,9 @@
 #include "freertos/task.h"
 #include "progre_settings.h"
 #include "progre_wifi.h"
+#include "progre_display.h"
+#include "nvs.h"
+#include "esp_netif.h"
 
 static const char *TAG = "PROGRE_USB";
 
@@ -45,6 +48,13 @@ static void handle_line(char *line)
         cJSON_AddStringToObject(r,"version",esp_app_get_description()->version);
         cJSON_AddStringToObject(r,"wifi_state",progre_wifi_state_name(progre_wifi_get_state()));
         cJSON_AddStringToObject(r,"ssid",progre_settings_wifi_ssid());
+        esp_netif_ip_info_t info;
+        esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (sta && esp_netif_get_ip_info(sta, &info) == ESP_OK) {
+            char ip[16];
+            snprintf(ip, sizeof(ip), IPSTR, IP2STR(&info.ip));
+            cJSON_AddStringToObject(r, "ip", ip);
+        }
         cJSON_AddStringToObject(r,"bridge_host",progre_settings_bridge_host());
         cJSON_AddNumberToObject(r,"bridge_port",progre_settings_bridge_port());
         reply(r);
@@ -99,6 +109,23 @@ static void handle_line(char *line)
         cJSON *r=base_reply(cmd,err==ESP_OK); if(err!=ESP_OK)cJSON_AddStringToObject(r,"error",esp_err_to_name(err)); reply(r);
     } else if (!strcmp(cmd, "wifi_reconnect")) {
         esp_err_t err=progre_wifi_reconnect(); cJSON *r=base_reply(cmd,err==ESP_OK); if(err!=ESP_OK)cJSON_AddStringToObject(r,"error",esp_err_to_name(err)); reply(r);
+    } else if (!strcmp(cmd, "face_set")) {
+        cJSON *color = cJSON_GetObjectItemCaseSensitive(q, "color");
+        esp_err_t err = ESP_ERR_INVALID_ARG;
+        if (cJSON_IsNumber(color) && color->valuedouble >= 0 &&
+            color->valuedouble <= 65535 && color->valuedouble == color->valueint) {
+            nvs_handle_t h;
+            err = nvs_open("progre", NVS_READWRITE, &h);
+            if (err == ESP_OK) {
+                err = nvs_set_u16(h, "face_color", (uint16_t)color->valueint);
+                if (err == ESP_OK) err = nvs_commit(h);
+                nvs_close(h);
+            }
+            if (err == ESP_OK) progre_display_set_color((uint16_t)color->valueint);
+        }
+        cJSON *r = base_reply(cmd, err == ESP_OK);
+        if (err != ESP_OK) cJSON_AddStringToObject(r, "error", esp_err_to_name(err));
+        reply(r);
     } else if (!strcmp(cmd, "reboot")) {
         cJSON *r=base_reply(cmd,true); reply(r); vTaskDelay(pdMS_TO_TICKS(150)); esp_restart();
     } else {
@@ -176,6 +203,13 @@ static void usb_task(void *arg)
 
 esp_err_t progre_usb_control_init(void)
 {
+    nvs_handle_t h;
+    uint16_t color = 0xffff;
+    if (nvs_open("progre", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u16(h, "face_color", &color);
+        nvs_close(h);
+    }
+    progre_display_set_color(color);
     BaseType_t ok=xTaskCreate(usb_task,"progre_usb",6144,NULL,5,NULL);
     return ok==pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }

@@ -1,3 +1,6 @@
+import os
+import ipaddress
+import re
 from pathlib import Path
 import time
 import sys
@@ -42,7 +45,9 @@ from progre_config import DEFAULT_CONFIG, load_config, save_config
 app = Flask(__name__)
 
 OLLAMA = "http://127.0.0.1:11434/api/tags"
-HEALTH = "http://127.0.0.1:8765/health"
+BRIDGE_PORT = int(os.environ.get("PROGRE_BRIDGE_PORT", "8785"))
+COCKPIT_PORT = int(os.environ.get("PROGRE_COCKPIT_PORT", "8786"))
+HEALTH = f"http://127.0.0.1:{BRIDGE_PORT}/health"
 
 VOICE_DIR = ROOT / "runtime" / "voices"
 
@@ -402,9 +407,30 @@ def current_device_port():
     return load_lifecycle().get("detection", {}).get("port")
 
 def local_lan_ip():
+    def usable(value):
+        try:
+            ip = ipaddress.ip_address(value)
+            return not ip.is_unspecified and not ip.is_loopback
+        except (ValueError, TypeError):
+            return False
+
+    lifecycle = load_lifecycle()
+    detection = lifecycle.get("detection", {})
+    target = detection.get("status", {}).get("ip")
+    # A fresh USB open may reboot the board; allow DHCP to finish.
+    if not usable(target) and detection.get("state") == "progre_detected":
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                target = device_command(detection["port"], "status", timeout=2).get("ip")
+            except Exception:
+                break
+            if usable(target):
+                break
+            time.sleep(0.25)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.connect(("192.0.2.1", 9))
+        sock.connect((target if usable(target) else "192.0.2.1", 9))
         return sock.getsockname()[0]
     except Exception:
         return "127.0.0.1"
@@ -417,6 +443,23 @@ def api_device_status_live():
     if not port: return {"ok":False,"error":"device_not_detected"},409
     try: return device_command(port,"status")
     except Exception as exc: return {"ok":False,"error":"device_unavailable","message":str(exc)},503
+
+@app.post("/api/device/appearance")
+def api_device_appearance():
+    data = request.get_json(silent=True)
+    color = data.get("color") if isinstance(data, dict) else None
+    if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        return {"ok": False, "error": "Use a six-digit hex color."}, 400
+    port = current_device_port()
+    if not port:
+        return {"ok": False, "error": "Detect AIPI first."}, 409
+    rgb = int(color[1:], 16)
+    rgb565 = ((rgb >> 19) << 11) | (((rgb >> 10) & 63) << 5) | ((rgb >> 3) & 31)
+    try:
+        return device_command(port, "face_set", color=rgb565)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 503
+
 
 @app.post("/api/device/wifi/scan")
 def api_wifi_scan():
@@ -434,7 +477,7 @@ def api_device_configure():
     host = str(data.get("bridge_host") or local_lan_ip()).strip()
 
     try:
-        bridge_port = int(data.get("bridge_port") or 8765)
+        bridge_port = int(data.get("bridge_port") or BRIDGE_PORT)
     except (TypeError, ValueError):
         return {"ok": False, "error": "invalid_bridge_port"}, 400
 
@@ -572,7 +615,7 @@ def api_device_reboot():
 
 @app.get("/api/host/network")
 def api_host_network():
-    return {"ok":True,"bridge_host":local_lan_ip(),"bridge_port":8765}
+    return {"ok":True,"bridge_host":local_lan_ip(),"bridge_port":BRIDGE_PORT}
 
 @app.get("/")
 def index():
@@ -910,7 +953,7 @@ pre{
       <label>Wi-Fi network</label><select id="wifi-ssid"><option value="">Scan first…</option></select>
       <label>Wi-Fi password</label><input id="wifi-password" type="password" autocomplete="new-password" placeholder="Not stored by Cockpit">
       <label>This computer / Bridge address</label><input id="bridge-host" placeholder="Detected automatically">
-      <label>Bridge port</label><input id="bridge-port" type="number" value="8765" min="1" max="65535">
+      <label>Bridge port</label><input id="bridge-port" type="number" value="8785" min="1" max="65535">
       <div class="portability-actions"><button class="primary" onclick="configureProgre()">Connect Progre</button><button onclick="rebootProgre()">Reboot</button></div>
       <div id="commission-message" class="portability-note">USB commissioning does not require rebuilding firmware after this protocol is installed.</div>
     </div>
@@ -964,6 +1007,11 @@ pre{
 
 <section class="card">
 <h2>Voice Character</h2>
+<label for="face-color">Robot face and eyes</label>
+<input id="face-color" type="color" value="#ffffff" style="height:44px;padding:4px">
+<button type="button" onclick="applyFace()">Apply face color to AIPI</button>
+<p class="note">White by default. Breathing and blinking while idle; mouth follows speech.
+Left button: battery power. Hold the right button to speak (up to 8 seconds), then release.</p>
 
 <label>Piper voice</label>
 <select id="voice"></select>
@@ -990,12 +1038,12 @@ pre{
 
 <div class="row">
  <span>Voice Bridge</span>
- <strong>127.0.0.1:8765</strong>
+ <strong>127.0.0.1:8785</strong>
 </div>
 
 <div class="row">
  <span>Cockpit</span>
- <strong>127.0.0.1:8766</strong>
+ <strong>127.0.0.1:8786</strong>
 </div>
 
 <div class="row">
@@ -1040,6 +1088,16 @@ function options(el,values,current){
    o.value=v;o.textContent=v;o.selected=v===current;
    el.appendChild(o);
  });
+}
+
+async function applyFace(){
+ try {
+  const r=await fetch("/api/device/appearance",{method:"POST",
+   headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({color:$("face-color").value})});
+  const d=await r.json();
+  $("message").textContent=r.ok&&d.ok?"Face color saved on AIPI.":d.error||"Could not apply color.";
+ } catch(e){$("message").textContent="AIPI unavailable: "+e;}
 }
 
 function labels(){
@@ -1946,11 +2004,11 @@ if __name__ == "__main__":
     print("================================")
     print("         PROGRE COCKPIT")
     print("================================")
-    print("http://127.0.0.1:8766")
+    print(f"http://127.0.0.1:{COCKPIT_PORT}")
 
     app.run(
         host="127.0.0.1",
-        port=8766,
+        port=COCKPIT_PORT,
         debug=False,
         threaded=True,
     )
