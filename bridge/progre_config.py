@@ -21,6 +21,9 @@ LOCK = RLock()
 
 DEFAULT_CONFIG = {
     "model": "qwen3.5:2b",
+    "japanese_voice": "jf_alpha",
+    "recognition_language": "auto",
+    "japanese_practice": False,
     "voice": "en_US-arctic-medium.onnx",
     "pitch_semitones": 2.0,
     "volume": 0.90,
@@ -95,6 +98,14 @@ def _coerce(config: dict) -> dict:
         ),
     )
 
+    if result.get("recognition_language") not in ("auto", "en", "ja"):
+        raise ValueError("Choose auto, en or ja for recognition language.")
+    if result.get("japanese_voice") not in (
+        "jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo"
+    ):
+        raise ValueError("Choose an installed Japanese Kokoro voice.")
+    if not isinstance(result.get("japanese_practice"), bool):
+        raise ValueError("Japanese practice must be on or off.")
     return result
 
 

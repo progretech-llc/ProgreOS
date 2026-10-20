@@ -9,7 +9,7 @@ idf_component_register(
     INCLUDE_DIRS
         "."
     REQUIRES
-        esp_app_format esp_http_client mbedtls
+        esp_app_format esp_http_client mbedtls esp-tls esp_timer
         json
         esp_driver_gpio
         esp_driver_spi

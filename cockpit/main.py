@@ -41,6 +41,8 @@ BRIDGE = ROOT / "bridge"
 sys.path.insert(0, str(BRIDGE))
 
 from progre_config import DEFAULT_CONFIG, load_config, save_config
+import remote_access
+import multilingual_voice
 
 app = Flask(__name__)
 
@@ -132,7 +134,10 @@ def voices():
     if not VOICE_DIR.exists():
         return []
 
-    return sorted(x.name for x in VOICE_DIR.glob("*.onnx"))
+    return sorted(x.name for x in VOICE_DIR.glob("*.onnx")) + [
+        "kokoro:" + voice for voice in multilingual_voice.available_voices()
+        if voice.startswith(("af_", "am_", "bf_", "bm_"))
+    ]
 
 
 def bridge():
@@ -154,6 +159,7 @@ def status():
         config=load_config(),
         models=models(),
         voices=voices(),
+        japanese_voices=[v for v in multilingual_voice.available_voices() if v.startswith(("jf_", "jm_"))],
         bridge=bridge(),
     )
 
@@ -470,11 +476,22 @@ def api_wifi_scan():
 
 @app.post("/api/device/configure")
 def api_device_configure():
-    port=current_device_port(); data=request.get_json(silent=True) or {}
+    port=current_device_port(); data=request.get_json(silent=True)
+    if not isinstance(data, dict): return {"ok": False, "error": "JSON object required"}, 400
     if not port: return {"ok":False,"error":"device_not_detected"},409
     ssid = str(data.get("ssid", "")).strip()
     password = str(data.get("password", ""))
-    host = str(data.get("bridge_host") or local_lan_ip()).strip()
+    if data.get("connection_mode") == "hotspot":
+        try:
+            state = remote_access.status()
+            if not state["public"]:
+                return {"ok": False, "error": "Enable hotspot access first."}, 409
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}, 503
+        host = state["hostname"]
+        data["bridge_port"] = state["port"]
+    else:
+        host = str(data.get("bridge_host") or local_lan_ip()).strip()
 
     try:
         bridge_port = int(data.get("bridge_port") or BRIDGE_PORT)
@@ -491,6 +508,11 @@ def api_device_configure():
         return {"ok": False, "error": "invalid_bridge_port"}, 400
 
     try:
+        security = device_command(port, "bridge_security",
+            tls=data.get("connection_mode") == "hotspot",
+            token=remote_access.device_key())
+        if not security.get("ok"):
+            return {"ok": False, "error": "Update AIPI firmware before configuring its connection."}, 502
         bridge_reply = device_command(
             port,
             "bridge_set",
@@ -612,6 +634,66 @@ def api_device_reboot():
     if not port: return {"ok":False,"error":"device_not_detected"},409
     try: return device_command(port,"reboot")
     except Exception as exc: return {"ok":False,"error":"reboot_failed","message":str(exc)},503
+
+@app.get("/api/remote")
+def api_remote_status():
+    try:
+        return {"ok": True, **remote_access.status()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 503
+
+
+@app.post("/api/remote/enable")
+def api_remote_enable():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or data.get("confirm_public") is not True:
+        return {"ok": False, "error": "Confirm the authenticated endpoint will be internet-accessible."}, 409
+    try:
+        remote_access.device_key()
+        return {"ok": True, **remote_access.enable(public=True)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 503
+
+
+@app.post("/api/remote/disable")
+def api_remote_disable():
+    try:
+        return {"ok": True, **remote_access.disable()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 503
+
+
+@app.post("/api/device/connection-mode")
+def api_connection_mode():
+    data = request.get_json(silent=True)
+    mode = data.get("mode") if isinstance(data, dict) else None
+    if mode not in ("local", "hotspot"):
+        return {"ok": False, "error": "Choose local or hotspot."}, 400
+    port = current_device_port()
+    if not port:
+        return {"ok": False, "error": "Detect AIPI over USB first."}, 409
+    try:
+        if mode == "hotspot":
+            state = remote_access.status()
+            if not state["public"]:
+                return {"ok": False, "error": "Enable hotspot access before pairing."}, 409
+            host, bridge_port = state["hostname"], state["port"]
+            security = device_command(port, "bridge_security", tls=True, token=remote_access.device_key())
+        else:
+            host, bridge_port = local_lan_ip(), BRIDGE_PORT
+            security = device_command(port, "bridge_security", tls=False, token=remote_access.device_key())
+        if not security.get("ok"):
+            return {"ok": False, "error": "Update the AIPI firmware before pairing."}, 502
+        reply = device_command(port, "bridge_set", host=host, port=bridge_port)
+        if not reply.get("ok"):
+            return {"ok": False, "error": "Device refused the bridge address."}, 502
+        lifecycle = load_lifecycle()
+        lifecycle.setdefault("detection", {})["status"] = device_command(port, "status")
+        LIFECYCLE_FILE.write_text(json.dumps(lifecycle, indent=2) + "\n")
+        return {"ok": True, "host": host, "port": bridge_port, "tls": mode == "hotspot"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 503
+
 
 @app.get("/api/host/network")
 def api_host_network():
@@ -950,6 +1032,12 @@ pre{
       <div class="portability-card-head"><div><div class="portability-kicker">COMMISSIONING</div><h3>Wi-Fi &amp; Bridge</h3></div></div>
       <div class="portability-detail">Connect Progre by USB, scan networks, then point him at this computer's local Voice Bridge.</div>
       <div class="portability-actions"><button onclick="scanWifi()">Scan Wi-Fi</button><button onclick="reconnectProgre()">Reconnect</button></div>
+      <label for="connection-mode">Connection</label>
+      <select id="connection-mode"><option value="local">Home network</option><option value="hotspot">Phone hotspot / remote HTTPS</option></select>
+      <p id="remote-status" class="portability-note">Checking Tailscale…</p>
+      <label style="display:flex;gap:8px;align-items:center"><input id="public-confirm" type="checkbox" style="width:auto">Allow an internet-accessible voice endpoint protected by the AIPI device key.</label>
+      <div class="portability-actions"><button onclick="enableHotspot()">Enable hotspot access</button><button onclick="pairRemote()">Apply connection mode</button><button onclick="disableHotspot()">Disable remote access</button></div>
+      <p class="portability-note">Pair once over USB, then select the phone’s 2.4 GHz hotspot below. Models stay on the workstation, which must be awake with AIPI Control Center running. Only the voice endpoint is shared.</p>
       <label>Wi-Fi network</label><select id="wifi-ssid"><option value="">Scan first…</option></select>
       <label>Wi-Fi password</label><input id="wifi-password" type="password" autocomplete="new-password" placeholder="Not stored by Cockpit">
       <label>This computer / Bridge address</label><input id="bridge-host" placeholder="Detected automatically">
@@ -1013,8 +1101,14 @@ pre{
 <p class="note">White by default. Breathing and blinking while idle; mouth follows speech.
 Left button: battery power. Hold the right button to speak (up to 8 seconds), then release.</p>
 
-<label>Piper voice</label>
+<label>English voice</label>
 <select id="voice"></select>
+<label for="japanese-voice">Japanese voice (Kokoro)</label>
+<select id="japanese-voice"></select>
+<label for="recognition-language">Speech recognition</label>
+<select id="recognition-language"><option value="auto">Auto: English / Japanese</option><option value="ja">Japanese</option><option value="en">English</option></select>
+<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="japanese-practice" style="width:auto">Japanese practice partner</label>
+<p class="note">Japanese text switches to the selected Japanese voice. Both voices use the same pitch and volume below.</p>
 
 <label>Pitch</label>
 <input id="pitch" type="range"
@@ -1116,6 +1210,9 @@ function show(d){
 
  options($("model"),d.models||[],c.model);
  options($("voice"),d.voices||[],c.voice);
+ options($("japanese-voice"),d.japanese_voices||[],c.japanese_voice);
+ $("recognition-language").value=c.recognition_language;
+ $("japanese-practice").checked=c.japanese_practice;
 
  $("temperature").value=c.temperature;
  $("tokens").value=c.max_tokens;
@@ -1148,6 +1245,9 @@ async function save(){
  const data={
    model:$("model").value,
    voice:$("voice").value,
+   japanese_voice:$("japanese-voice").value||"jf_alpha",
+   recognition_language:$("recognition-language").value,
+   japanese_practice:$("japanese-practice").checked,
    temperature:Number($("temperature").value),
    max_tokens:Number($("tokens").value),
    pitch_semitones:Number($("pitch").value),
@@ -1356,6 +1456,9 @@ async function loadDevice() {
 
     const detection = data.device?.detection || {};
     const state = detection.state || "not_scanned";
+    const mode = document.getElementById("connection-mode");
+    if (detection.status && "bridge_tls" in detection.status)
+      mode.value = detection.status.bridge_tls ? "hotspot" : "local";
 
     document.getElementById("device-state").textContent =
       state === "not_scanned" ? "Not scanned" : state;
@@ -1818,6 +1921,32 @@ async function scanWifi() {
     );
   }
 }
+async function remoteStatus(){
+ try {
+  const d=await (await fetch("/api/remote")).json();
+  document.getElementById("remote-status").textContent=d.ok?
+   (d.public?"Hotspot access enabled: ":d.configured?"Private test mode: ":"Tailscale ready: ")+d.url:d.error;
+ } catch(e){document.getElementById("remote-status").textContent=String(e);}
+}
+async function enableHotspot(){
+ const confirmed=document.getElementById("public-confirm").checked;
+ if(!confirmed){document.getElementById("remote-status").textContent="Check the internet-access confirmation first.";return;}
+ const d=await (await fetch("/api/remote/enable",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({confirm_public:true})})).json();
+ if(!d.ok){document.getElementById("remote-status").textContent=d.error;return;}
+ await remoteStatus();
+}
+async function disableHotspot(){
+ const d=await (await fetch("/api/remote/disable",{method:"POST"})).json();
+ if(!d.ok){document.getElementById("remote-status").textContent=d.error;return;}
+ await remoteStatus();
+}
+async function pairRemote(){
+ const d=await (await fetch("/api/device/connection-mode",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:document.getElementById("connection-mode").value})})).json();
+ if(d.ok){document.getElementById("bridge-host").value=d.host;document.getElementById("bridge-port").value=d.port;}
+ document.getElementById("remote-status").textContent=d.ok?"Connection saved on AIPI: "+d.host+":"+d.port:d.error;
+}
+remoteStatus();
+
 async function configureProgre() {
   const msg = document.getElementById("commission-message");
   const passwordField = document.getElementById("wifi-password");
@@ -1827,6 +1956,7 @@ async function configureProgre() {
   const body = {
     ssid: document.getElementById("wifi-ssid").value,
     password: passwordField.value,
+    connection_mode: document.getElementById("connection-mode").value,
     bridge_host: document.getElementById("bridge-host").value,
     bridge_port: Number(document.getElementById("bridge-port").value)
   };

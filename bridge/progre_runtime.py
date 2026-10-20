@@ -26,6 +26,7 @@ def discover():
         shutil.which("whisper-cli") or "",
     )
     whisper_model = first_existing(
+        MODEL_DIR / "ggml-small.bin",
         MODEL_DIR / "ggml-base.en.bin",
         WHISPER_DIR / "models/ggml-base.en.bin",
     )

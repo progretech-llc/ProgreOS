@@ -94,6 +94,65 @@ class Controls(unittest.TestCase):
             self.assertEqual(response.status_code, 500)
             self.assertTrue(response.is_json)
 
+class RemoteAccess(unittest.TestCase):
+    def test_remote_listener_requires_device_key_and_limits_routes(self):
+        client = bridge.remote_app.test_client()
+        with patch.object(bridge, "device_key", return_value="k" * 43):
+            self.assertEqual(client.get("/health").status_code, 401)
+            self.assertEqual(client.post("/api/v1/audio", data=b"xx").status_code, 401)
+            headers = {"Authorization": "Bearer " + "k" * 43}
+            self.assertEqual(client.get("/health", headers=headers).status_code, 200)
+            self.assertEqual(client.get("/api/config", headers=headers).status_code, 404)
+            self.assertEqual(client.post("/api/v1/audio", data=b"x" * 256002, headers=headers).status_code, 413)
+            bridge.remote_audio_lock.acquire()
+            try:
+                self.assertEqual(client.post("/api/v1/audio", data=b"xx", headers=headers).status_code, 429)
+            finally:
+                bridge.remote_audio_lock.release()
+
+    def test_public_exposure_requires_explicit_confirmation(self):
+        with patch.object(cockpit.remote_access, "enable") as enable:
+            response = cockpit.app.test_client().post("/api/remote/enable", json={})
+            self.assertEqual(response.status_code, 409)
+            enable.assert_not_called()
+
+    def test_funnel_preserves_other_services(self):
+        import remote_access
+        state = {"BackendState": "Running", "Self": {"DNSName": "device.example.ts.net."}}
+        config = {"TCP": {"8443": {"HTTPS": True}}, "Web": {
+            "device.example.ts.net:8443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}}}}}
+        with patch.object(remote_access, "_run", side_effect=[json.dumps(state), json.dumps(config)]) as run:
+            with self.assertRaisesRegex(RuntimeError, "another service"):
+                remote_access.enable(public=True)
+            self.assertEqual(run.call_count, 2)
+
+
+class JapaneseVoice(unittest.TestCase):
+    def test_bilingual_voice_selection_and_shared_pitch_snapshot(self):
+        from progre_config import DEFAULT_CONFIG
+        config = {**DEFAULT_CONFIG, "voice": "kokoro:af_heart", "japanese_voice": "jm_kumo", "pitch_semitones": 5.5}
+        with patch.object(bridge, "load_config", return_value=config) as load, patch.object(
+            bridge.multilingual_voice, "synthesize"
+        ) as synthesize, patch.object(bridge, "_wav_to_pcm_16k_mono", return_value=b"xx") as convert:
+            result = bridge._synthesize("Hello. こんにちは。", "/tmp")
+            self.assertTrue(result)
+            self.assertEqual([(c.args[1], c.args[2]) for c in synthesize.call_args_list],
+                             [("af_heart", False), ("jm_kumo", True)])
+            self.assertEqual(load.call_count, 1)
+            for call in convert.call_args_list:
+                self.assertEqual(call.args[1]["pitch_semitones"], 5.5)
+
+    def test_multilingual_settings_reject_invalid_values(self):
+        from progre_config import _coerce
+        for invalid in ({"recognition_language": "xx"}, {"japanese_voice": "missing"}, {"japanese_practice": "false"}):
+            with self.assertRaises(ValueError):
+                _coerce(invalid)
+
+    def test_segmentation_keeps_numbers_with_japanese(self):
+        import multilingual_voice
+        self.assertEqual(list(multilingual_voice.segments("Say 3時です。 Then hello.")),
+                         [("Say", False), ("3時です。", True), ("Then hello.", False)])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,8 @@ static char s_ssid[33];
 static char s_password[65];
 static char s_bridge_host[96];
 static uint16_t s_bridge_port;
+static bool s_bridge_tls;
+static char s_bridge_token[65];
 
 static void load_string(nvs_handle_t h, const char *key, char *out, size_t cap, const char *fallback)
 {
@@ -36,6 +38,10 @@ esp_err_t progre_settings_init(void)
     uint16_t port = CONFIG_PROGRE_BRIDGE_PORT;
     if (nvs_get_u16(h, "bridge_port", &port) != ESP_OK) port = CONFIG_PROGRE_BRIDGE_PORT;
     s_bridge_port = port;
+    uint8_t tls = 0;
+    nvs_get_u8(h, "bridge_tls", &tls);
+    s_bridge_tls = tls != 0;
+    load_string(h, "bridge_token", s_bridge_token, sizeof(s_bridge_token), "");
     nvs_close(h);
     return ESP_OK;
 }
@@ -68,5 +74,30 @@ esp_err_t progre_settings_set_bridge(const char *host, uint16_t port)
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     if (err == ESP_OK) { strlcpy(s_bridge_host, host, sizeof(s_bridge_host)); s_bridge_port = port; }
+    return err;
+}
+
+bool progre_settings_bridge_tls(void) { return s_bridge_tls; }
+const char *progre_settings_bridge_token(void) { return s_bridge_token; }
+
+esp_err_t progre_settings_set_security(bool tls, const char *token)
+{
+    if (!token || (tls && strlen(token) != 43) || strlen(token) >= sizeof(s_bridge_token))
+        return ESP_ERR_INVALID_ARG;
+    for (const char *c = token; *c; ++c)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+              (*c >= '0' && *c <= '9') || *c == '_' || *c == '-'))
+            return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, "bridge_tls", tls);
+    if (err == ESP_OK) err = nvs_set_str(h, "bridge_token", token);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK) {
+        s_bridge_tls = tls;
+        strlcpy(s_bridge_token, token, sizeof(s_bridge_token));
+    }
     return err;
 }

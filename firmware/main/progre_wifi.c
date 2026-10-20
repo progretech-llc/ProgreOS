@@ -6,6 +6,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "progre_settings.h"
@@ -159,6 +160,8 @@ esp_err_t progre_wifi_init(void)
 
     ESP_LOGI(TAG, "Wi-Fi station initialized for SSID '%s'", progre_settings_wifi_ssid());
 
+    esp_sntp_config_t time_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    ESP_RETURN_ON_ERROR(esp_netif_sntp_init(&time_config), TAG, "SNTP init failed");
     return esp_wifi_start();
 }
 

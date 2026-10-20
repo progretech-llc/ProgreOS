@@ -12,3 +12,13 @@ https://keithito.com/LJ-Speech-Dataset/ .
 
 Model binaries and configuration files are local runtime artifacts, excluded
 from Git. These notes describe workstation installation, not bundled assets.
+
+Kokoro model and voice bank were scoped copies of project-avalon's existing
+local assets. The originals are unchanged. Upstream model:
+https://huggingface.co/hexgrad/Kokoro-82M (Apache-2.0).
+ONNX runtime: https://github.com/thewh1teagle/kokoro-onnx .
+Japanese G2P: https://github.com/hexgrad/misaki and
+https://github.com/r9y9/pyopenjtalk . Its Open JTalk dictionary is downloaded
+once during setup; speech generation then works locally.
+Multilingual STT: ggml-small.bin from
+https://huggingface.co/ggerganov/whisper.cpp .

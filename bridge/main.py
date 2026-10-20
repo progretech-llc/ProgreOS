@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hmac
+import threading
 import base64
 import subprocess
 import tempfile
@@ -13,6 +15,8 @@ from datetime import datetime, timezone
 
 from flask import Flask, Response, jsonify, request
 
+from remote_access import device_key, REMOTE_PORT
+import multilingual_voice
 from progre_config import load_config
 from progre_runtime import discover as runtime_discover
 
@@ -117,8 +121,8 @@ def _pcm_to_wav(pcm: bytes, path: str):
         wav.writeframes(pcm)
 
 
-def _wav_to_pcm_16k_mono(wav_path):
-    cfg = load_config()
+def _wav_to_pcm_16k_mono(wav_path, config=None):
+    cfg = load_config() if config is None else config
 
     pitch_semitones = float(
         cfg["pitch_semitones"]
@@ -205,6 +209,8 @@ def _transcribe(pcm: bytes, workdir: str) -> str:
         [
             whisper,
             "-m", whisper_model,
+            "-l", load_config()["recognition_language"],
+            "-t", "8",
             "-f", input_wav,
             "-otxt",
             "-of", output_base,
@@ -240,7 +246,13 @@ def _ask_progre(transcript: str) -> str:
     payload = json.dumps(
         {
             "model": cfg["model"],
-            "system": PROGRE_SYSTEM_PROMPT,
+            "system": PROGRE_SYSTEM_PROMPT + (
+                "\nJapanese practice is enabled. Be a patient Japanese conversation partner. "
+                "Use short, beginner-friendly Japanese sentences in Japanese script, "
+                "with a short English explanation only when useful. Gently correct mistakes "
+                "and ask one practice question at a time. Avoid emoji and unspoken stage directions."
+                if cfg["japanese_practice"] else ""
+            ),
             "prompt": transcript,
             "stream": False,
             "think": False,
@@ -279,8 +291,8 @@ def _ask_progre(transcript: str) -> str:
     return answer
 
 
-def _synthesize(text: str, workdir: str) -> bytes:
-    cfg = load_config()
+def _synthesize_piper(text: str, workdir: str, config=None) -> bytes:
+    cfg = load_config() if config is None else config
     output_wav = str(Path(workdir) / "response.wav")
 
     runtime = runtime_discover()
@@ -313,8 +325,31 @@ def _synthesize(text: str, workdir: str) -> bytes:
             "Piper did not produce response.wav"
         )
 
-    return _wav_to_pcm_16k_mono(output_wav)
+    return _wav_to_pcm_16k_mono(output_wav, cfg)
 
+
+
+def _synthesize(text: str, workdir: str) -> bytes:
+    cfg = load_config()
+    parts = list(multilingual_voice.segments(text))
+    if not cfg["voice"].startswith("kokoro:") and not any(j for _, j in parts):
+        return _synthesize_piper(text, workdir, cfg)
+    output = []
+    for index, (part, japanese) in enumerate(parts):
+        if japanese or cfg["voice"].startswith("kokoro:"):
+            voice = cfg["japanese_voice"] if japanese else cfg["voice"].split(":", 1)[1]
+            wav = Path(workdir) / f"segment-{index}.wav"
+            multilingual_voice.synthesize(part, voice, japanese, wav)
+            # Both languages share this exact pitch, tempo and volume path.
+            pcm = _wav_to_pcm_16k_mono(wav, cfg)
+        else:
+            pcm = _synthesize_piper(part, workdir, cfg)
+        if output:
+            output.append(b"\0" * 1600)  # 50 ms between different voices.
+        output.append(pcm)
+    if not output:
+        raise RuntimeError("No speakable text in reply.")
+    return b"".join(output)
 
 
 @app.post("/api/v1/audio")
@@ -402,7 +437,39 @@ def device_audio():
         ), 500
 
 
+# Funnel points only at this authenticated listener, never Cockpit or Ollama.
+remote_app = Flask("progre-remote-voice", static_folder=None)
+remote_app.config["MAX_CONTENT_LENGTH"] = app.config["MAX_CONTENT_LENGTH"]
+remote_audio_lock = threading.Lock()
+
+
+@remote_app.before_request
+def authenticate_remote():
+    expected = ("Bearer " + device_key()).encode("utf-8")
+    supplied = request.headers.get("Authorization", "").encode("utf-8")
+    if not hmac.compare_digest(supplied, expected):
+        return jsonify(error="unauthorized"), 401
+
+
+@remote_app.post("/api/v1/audio")
+def remote_audio():
+    if not remote_audio_lock.acquire(blocking=False):
+        return jsonify(error="voice_bridge_busy"), 429
+    try:
+        return device_audio()
+    finally:
+        remote_audio_lock.release()
+
+
+remote_app.add_url_rule("/health", view_func=health, methods=["GET"])
+remote_app.add_url_rule("/api/v1/device/hello", view_func=device_hello, methods=["POST"])
+
+
 if __name__ == "__main__":
+    from werkzeug.serving import make_server
+    device_key()
+    remote_server = make_server("127.0.0.1", REMOTE_PORT, remote_app, threaded=True)
+    threading.Thread(target=remote_server.serve_forever, daemon=True).start()
     hostname = socket.gethostname()
 
     print("=" * 60)

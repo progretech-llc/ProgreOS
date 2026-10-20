@@ -1,10 +1,12 @@
 #include "progre_bridge.h"
 
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_crt_bundle.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -15,6 +17,25 @@
 #include "progre_audio.h"
 #include "progre_display.h"
 #include "mbedtls/base64.h"
+static void set_device_auth(esp_http_client_handle_t client)
+{
+    if (progre_settings_bridge_tls()) {
+        char authorization[80];
+        snprintf(authorization, sizeof(authorization), "Bearer %s", progre_settings_bridge_token());
+        esp_http_client_set_header(client, "Authorization", authorization);
+    }
+}
+
+static bool remote_clock_ready(void)
+{
+    if (!progre_settings_bridge_tls()) return true;
+    for (int i = 0; i < 120; ++i) {
+        if (time(NULL) >= 1735689600) return true;
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    return false;
+}
+
 static const char *TAG = "PROGRE_BRIDGE";
 
 #define RESPONSE_BUFFER_SIZE 512
@@ -69,13 +90,19 @@ static void bridge_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Wi-Fi ready.");
+    if (!remote_clock_ready()) {
+        ESP_LOGE(TAG, "HTTPS unavailable: network time not synchronized");
+        vTaskDelete(NULL);
+        return;
+    }
 
     char url[160];
 
     snprintf(
         url,
         sizeof(url),
-        "http://%s:%d/api/v1/device/hello",
+        "%s://%s:%d/api/v1/device/hello",
+        progre_settings_bridge_tls() ? "https" : "http",
         progre_settings_bridge_host(),
         progre_settings_bridge_port()
     );
@@ -83,7 +110,7 @@ static void bridge_task(void *arg)
     const char *payload =
         "{"
         "\"device\":\"progre\","
-        "\"firmware\":\"progre-os-v0.5-connected\","
+        "\"firmware\":\"progre-os-v1.2-roaming\","
         "\"capabilities\":["
             "\"display\","
             "\"button\","
@@ -97,6 +124,8 @@ static void bridge_task(void *arg)
 
     esp_http_client_config_t config = {
         .url = url,
+        .crt_bundle_attach = progre_settings_bridge_tls() ? esp_crt_bundle_attach : NULL,
+        .disable_auto_redirect = true,
         .event_handler = bridge_http_event,
         .user_data = &response,
         .timeout_ms = 5000,
@@ -110,6 +139,8 @@ static void bridge_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+
+    set_device_auth(client);
 
     esp_http_client_set_method(
         client,
@@ -270,7 +301,8 @@ esp_err_t progre_bridge_exchange_audio(
     snprintf(
         url,
         sizeof(url),
-        "http://%s:%d/api/v1/audio",
+        "%s://%s:%d/api/v1/audio",
+        progre_settings_bridge_tls() ? "https" : "http",
         progre_settings_bridge_host(),
         progre_settings_bridge_port()
     );
@@ -286,6 +318,8 @@ esp_err_t progre_bridge_exchange_audio(
 
     esp_http_client_config_t config = {
         .url = url,
+        .crt_bundle_attach = progre_settings_bridge_tls() ? esp_crt_bundle_attach : NULL,
+        .disable_auto_redirect = true,
         .event_handler = bridge_audio_http_event,
         .user_data = &response,
         .timeout_ms = 10000,
@@ -299,6 +333,8 @@ esp_err_t progre_bridge_exchange_audio(
     if (client == NULL) {
         return ESP_ERR_NO_MEM;
     }
+
+    set_device_auth(client);
 
     esp_http_client_set_method(
         client,
@@ -617,12 +653,15 @@ esp_err_t progre_bridge_exchange_audio_stream(
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (!remote_clock_ready()) return ESP_ERR_TIMEOUT;
+
     char url[256];
 
     int url_len = snprintf(
         url,
         sizeof(url),
-        "http://%s:%d/api/v1/audio",
+        "%s://%s:%d/api/v1/audio",
+        progre_settings_bridge_tls() ? "https" : "http",
         progre_settings_bridge_host(),
         progre_settings_bridge_port()
     );
@@ -638,6 +677,8 @@ esp_err_t progre_bridge_exchange_audio_stream(
 
     esp_http_client_config_t config = {
         .url = url,
+        .crt_bundle_attach = progre_settings_bridge_tls() ? esp_crt_bundle_attach : NULL,
+        .disable_auto_redirect = true,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 120000,
         .event_handler =
@@ -652,6 +693,8 @@ esp_err_t progre_bridge_exchange_audio_stream(
     if (client == NULL) {
         return ESP_ERR_NO_MEM;
     }
+
+    set_device_auth(client);
 
     esp_err_t result = ESP_OK;
 

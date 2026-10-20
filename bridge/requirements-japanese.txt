@@ -1,0 +1,4 @@
+# Optional local multilingual speech; no cloud service is used.
+kokoro-onnx>=0.6.1,<0.7
+misaki[ja]>=0.9.4,<0.10
+soundfile>=0.13,<0.15

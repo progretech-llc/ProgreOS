@@ -37,3 +37,6 @@ runtime/voices/*.onnx.json
 # Progre local device lifecycle / recovery state
 data/device/*
 !data/device/.gitkeep
+
+# Local multilingual speech model
+runtime/kokoro/*.onnx

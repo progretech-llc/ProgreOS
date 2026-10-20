@@ -5,6 +5,7 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_heap_caps.h"
 
 #include "board_aipi_lite.h"
@@ -68,6 +69,8 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Display active.");
     ESP_LOGI(TAG, "Talk button active on GPIO%d.", PROGRE_BUTTON_TALK_PIN);
+    ESP_LOGI(TAG, "Reset reason: %d; internal heap: %u", esp_reset_reason(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     bool microphone_ready = false;
 
@@ -160,6 +163,9 @@ void app_main(void)
                         );
                     }
 
+                    ESP_LOGI(TAG, "Voice task stack remaining: %u bytes; minimum heap: %u",
+                             (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                             (unsigned)esp_get_minimum_free_heap_size());
                     progre_display_show_companion(47, false, false, false);
                 }
             }

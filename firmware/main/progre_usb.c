@@ -14,6 +14,7 @@
 #include "progre_display.h"
 #include "nvs.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 
 static const char *TAG = "PROGRE_USB";
 
@@ -44,6 +45,10 @@ static void handle_line(char *line)
     if (!strcmp(cmd, "status")) {
         cJSON *r=base_reply(cmd,true);
         cJSON_AddStringToObject(r,"device","progre");
+        cJSON_AddNumberToObject(r, "reset_reason", esp_reset_reason());
+        cJSON_AddNumberToObject(r, "uptime_ms", esp_timer_get_time() / 1000);
+        cJSON_AddNumberToObject(r, "free_heap", esp_get_free_heap_size());
+        cJSON_AddNumberToObject(r, "min_free_heap", esp_get_minimum_free_heap_size());
         cJSON_AddStringToObject(r,"firmware","Progre OS");
         cJSON_AddStringToObject(r,"version",esp_app_get_description()->version);
         cJSON_AddStringToObject(r,"wifi_state",progre_wifi_state_name(progre_wifi_get_state()));
@@ -57,6 +62,8 @@ static void handle_line(char *line)
         }
         cJSON_AddStringToObject(r,"bridge_host",progre_settings_bridge_host());
         cJSON_AddNumberToObject(r,"bridge_port",progre_settings_bridge_port());
+        cJSON_AddBoolToObject(r, "bridge_tls", progre_settings_bridge_tls());
+        cJSON_AddBoolToObject(r, "remote_paired", progre_settings_bridge_token()[0] != '\0');
         reply(r);
     } else if (!strcmp(cmd, "wifi_scan")) {
         progre_wifi_network_t nets[24]; size_t count=0;
@@ -109,6 +116,15 @@ static void handle_line(char *line)
         cJSON *r=base_reply(cmd,err==ESP_OK); if(err!=ESP_OK)cJSON_AddStringToObject(r,"error",esp_err_to_name(err)); reply(r);
     } else if (!strcmp(cmd, "wifi_reconnect")) {
         esp_err_t err=progre_wifi_reconnect(); cJSON *r=base_reply(cmd,err==ESP_OK); if(err!=ESP_OK)cJSON_AddStringToObject(r,"error",esp_err_to_name(err)); reply(r);
+    } else if (!strcmp(cmd, "bridge_security")) {
+        cJSON *tls = cJSON_GetObjectItemCaseSensitive(q, "tls");
+        cJSON *token = cJSON_GetObjectItemCaseSensitive(q, "token");
+        esp_err_t err = (cJSON_IsBool(tls) && cJSON_IsString(token))
+            ? progre_settings_set_security(cJSON_IsTrue(tls), token->valuestring)
+            : ESP_ERR_INVALID_ARG;
+        cJSON *r = base_reply(cmd, err == ESP_OK);
+        if (err != ESP_OK) cJSON_AddStringToObject(r, "error", esp_err_to_name(err));
+        reply(r);
     } else if (!strcmp(cmd, "face_set")) {
         cJSON *color = cJSON_GetObjectItemCaseSensitive(q, "color");
         esp_err_t err = ESP_ERR_INVALID_ARG;
